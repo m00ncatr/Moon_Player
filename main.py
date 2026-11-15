@@ -551,6 +551,7 @@ class Glyph(Widget):
     bg = ListProperty([0, 0, 0, 0])
     icon_dp = NumericProperty(24)
     scale = NumericProperty(1.0)
+    ox = NumericProperty(0.0)
     circle = BooleanProperty(False)
     corner = NumericProperty(10)
 
@@ -564,7 +565,7 @@ class Glyph(Widget):
         self._src = None
         self.bind(pos=self._redraw, size=self._redraw, source=self._redraw,
                   tint=self._redraw, bg=self._redraw, icon_dp=self._redraw,
-                  scale=self._redraw, circle=self._redraw, corner=self._redraw)
+                  scale=self._redraw, ox=self._redraw, circle=self._redraw, corner=self._redraw)
         self._redraw()
 
     def _redraw(self, *a):
@@ -584,7 +585,7 @@ class Glyph(Widget):
         self._ic.rgba = self.tint
         s = dp(self.icon_dp) * self.scale
         self._img.size = (s, s)
-        self._img.pos = (self.center_x - s / 2, self.center_y - s / 2)
+        self._img.pos = (self.center_x - s / 2 + self.ox, self.center_y - s / 2)
 
 
 class IconButton(ButtonBehavior, Glyph):
@@ -601,6 +602,12 @@ class IconButton(ButtonBehavior, Glyph):
         Animation.cancel_all(self, "scale")
         self.scale = 0.6
         Animation(scale=1.0, d=0.45, t="out_back").start(self)
+
+    def kick(self, direction):
+        """Иконку «выталкивает» в сторону и пружинит назад (след./пред. трек)."""
+        Animation.cancel_all(self, "ox")
+        self.ox = dp(14) * direction
+        Animation(ox=0, d=0.45, t="out_back").start(self)
 
 
 class RoundButton(ButtonBehavior, BoxLayout):
@@ -640,16 +647,35 @@ class Toast(Label):
 
 
 class MiniBar(ButtonBehavior, BoxLayout):
-    pass
+    want = BooleanProperty(False)
+    show = NumericProperty(0.0)
+
+    def on_want(self, inst, value):
+        Animation.cancel_all(self, "show")
+        Animation(show=1.0 if value else 0.0, d=0.35, t="out_cubic").start(self)
 
 
 class TrackRow(ButtonBehavior, BoxLayout):
+    press = NumericProperty(0.0)
+
+    def on_state(self, inst, value):
+        Animation.cancel_all(self, "press")
+        Animation(press=1.0 if value == "down" else 0.0,
+                  d=0.1 if value == "down" else 0.35, t="out_cubic").start(self)
+
     title = StringProperty("")
     idx = NumericProperty(0)
     playing = BooleanProperty(False)
 
 
 class PickRow(ButtonBehavior, BoxLayout):
+    press = NumericProperty(0.0)
+
+    def on_state(self, inst, value):
+        Animation.cancel_all(self, "press")
+        Animation(press=1.0 if value == "down" else 0.0,
+                  d=0.1 if value == "down" else 0.35, t="out_cubic").start(self)
+
     title = StringProperty("")
     subtitle = StringProperty("")
     idx = NumericProperty(0)
@@ -930,9 +956,10 @@ KV = """
 
 <MiniBar>:
     size_hint_y: None
-    height: dp(60) if (app.has_track and app.screen != 'player') else 0
-    opacity: 1 if (app.has_track and app.screen != 'player') else 0
-    disabled: not (app.has_track and app.screen != 'player')
+    want: bool(app.has_track and app.screen != 'player')
+    height: dp(60) * self.show
+    opacity: self.show
+    disabled: self.show < 0.5
     padding: dp(20), dp(6), dp(10), dp(6)
     spacing: dp(10)
     canvas.before:
@@ -982,10 +1009,16 @@ KV = """
     spacing: dp(12)
     canvas.before:
         Color:
-            rgba: (0.118, 0.843, 0.376, 0.20) if root.playing else ((1, 1, 1, 0.08) if root.state == 'down' else (0, 0, 0, 0))
+            rgba: (0.118, 0.843, 0.376, 0.20) if root.playing else (0, 0, 0, 0)
         RoundedRectangle:
             pos: self.pos
             size: self.size
+            radius: [dp(12)]
+        Color:
+            rgba: 1, 1, 1, 0.10 * root.press
+        RoundedRectangle:
+            pos: self.x + dp(10) * (1 - root.press), self.y
+            size: self.width - dp(20) * (1 - root.press), self.height
             radius: [dp(12)]
     on_release: app.play_from_list(root.idx)
     Glyph:
@@ -1019,10 +1052,16 @@ KV = """
     spacing: dp(12)
     canvas.before:
         Color:
-            rgba: (0.118, 0.843, 0.376, 0.18) if root.selected else ((1, 1, 1, 0.08) if root.state == 'down' else (0, 0, 0, 0))
+            rgba: (0.118, 0.843, 0.376, 0.18) if root.selected else (0, 0, 0, 0)
         RoundedRectangle:
             pos: self.pos
             size: self.size
+            radius: [dp(12)]
+        Color:
+            rgba: 1, 1, 1, 0.10 * root.press
+        RoundedRectangle:
+            pos: self.x + dp(10) * (1 - root.press), self.y
+            size: self.width - dp(20) * (1 - root.press), self.height
             radius: [dp(12)]
     on_release: app.row_tap(root.owner, root.idx)
     Glyph:
@@ -1200,7 +1239,7 @@ KV = """
             IconButton:
                 source: 'prev'
                 icon_dp: 30
-                on_release: app.prev_track()
+                on_release: self.kick(-1); app.prev_track()
             IconButton:
                 id: play_btn
                 size_hint: None, None
@@ -1215,7 +1254,7 @@ KV = """
             IconButton:
                 source: 'next'
                 icon_dp: 30
-                on_release: app.next_track()
+                on_release: self.kick(1); app.next_track()
             RoundButton:
                 size_hint: None, None
                 size: dp(64), dp(40)
@@ -1413,21 +1452,25 @@ FloatLayout:
                     pos: self.pos
                     size: self.size
             IconButton:
+                id: nav_library
                 source: 'list'
                 icon_dp: 26
                 tint: GREEN if app.screen in ('library', 'device') else DIM
                 on_release: app.go('library')
             IconButton:
+                id: nav_player
                 source: 'note'
                 icon_dp: 26
                 tint: GREEN if app.screen == 'player' else DIM
                 on_release: app.go('player')
             IconButton:
+                id: nav_online
                 source: 'globe'
                 icon_dp: 26
                 tint: GREEN if app.screen == 'online' else DIM
                 on_release: app.go('online')
             IconButton:
+                id: nav_settings
                 source: 'settings'
                 icon_dp: 26
                 tint: GREEN if app.screen == 'settings' else DIM
@@ -1477,7 +1520,7 @@ class PlayerApp(App):
         root = Builder.load_string(KV)
         self.lib, self.ply = root.ids.lib, root.ids.ply
         self.onl, self.dev = root.ids.onl, root.ids.dev
-        root.ids.sm.transition = SlideTransition(duration=0.25)
+        root.ids.sm.transition = SlideTransition(duration=0.3)
         return root
 
     def on_start(self):
@@ -1572,8 +1615,25 @@ class PlayerApp(App):
         sm.current = name
         self.screen = name
         self.screen_title = TITLES[name]
+        nav = self.root.ids.get("nav_" + ("library" if name == "device" else name))
+        if nav is not None:
+            nav.pop()
+        self.stagger_in(sm.get_screen(name))
         if name == "device":
             self.dev_open()
+
+    def stagger_in(self, screen):
+        """Элементы экрана по очереди плавно проявляются."""
+        if screen.name not in ("player", "settings"):
+            return
+        box = screen.children[0] if screen.children else None
+        if box is None:
+            return
+        for i, w in enumerate(reversed(box.children)):
+            Animation.cancel_all(w, "opacity")
+            w.opacity = 0
+            Animation(opacity=1, d=0.35, t="out_cubic").start(w) if i == 0 else \
+                (Animation(d=0.04 * i) + Animation(opacity=1, d=0.35, t="out_cubic")).start(w)
 
     def toast(self, text):
         t = self.root.ids.toast
