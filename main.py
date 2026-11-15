@@ -92,6 +92,55 @@ class AndroidEngine:
         self.volume = 0.9
         self.speed = 1.0
         self._speed_touched = False
+        self.on_focus = None          # app.on_focus_change(change)
+        self.stalled = False
+        self._duck = 1.0
+        self._am = self._listener = None
+        try:
+            from jnius import PythonJavaClass, java_method
+
+            class FocusListener(PythonJavaClass):
+                __javainterfaces__ = ["android/media/AudioManager$OnAudioFocusChangeListener"]
+                __javacontext__ = "app"
+
+                def __init__(self, engine):
+                    super().__init__()
+                    self.engine = engine
+
+                @java_method("(I)V")
+                def onAudioFocusChange(self, change):
+                    cb = self.engine.on_focus
+                    if cb:
+                        cb(change)
+
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            self._am = act.getSystemService("audio")
+            self._listener = FocusListener(self)
+        except Exception:
+            self._am = self._listener = None
+
+    def request_focus(self):
+        """Просим у Android звук: Телеграм/звонок отберёт его — плеер встанет на паузу."""
+        try:
+            if self._am is not None:
+                self._am.requestAudioFocus(self._listener, 3, 1)   # STREAM_MUSIC, GAIN
+        except Exception:
+            pass
+
+    def abandon_focus(self):
+        try:
+            if self._am is not None:
+                self._am.abandonAudioFocus(self._listener)
+        except Exception:
+            pass
+
+    def set_duck(self, on):
+        self._duck = 0.3 if on else 1.0
+        if self.mp:
+            try:
+                self.mp.setVolume(self.volume * self._duck, self.volume * self._duck)
+            except Exception:
+                pass
 
     def load(self, path):
         self.release()
@@ -102,7 +151,7 @@ class AndroidEngine:
         except Exception:
             mp.release()
             raise
-        mp.setVolume(self.volume, self.volume)
+        mp.setVolume(self.volume * self._duck, self.volume * self._duck)
         try:   # чтобы музыка не засыпала при выключенном экране
             act = self.autoclass("org.kivy.android.PythonActivity").mActivity
             mp.setWakeMode(act, 1)
@@ -125,6 +174,7 @@ class AndroidEngine:
 
     def start(self):
         if self.mp:
+            self.request_focus()
             self.mp.start()
             self.started, self.paused = True, False
             self._apply_speed()
@@ -169,8 +219,14 @@ class AndroidEngine:
             return False
         try:
             if not self.mp.isPlaying():
-                self.started = False
-                return True
+                dur, pos = self.length, self.position
+                if dur > 0 and pos >= dur - 1.5:       # правда дошли до конца
+                    self.started = False
+                    return True
+                # трек остановила система (Телеграм, звонок…), а не конец —
+                # не листаем дальше, а помечаем как паузу
+                self.paused = True
+                self.stalled = True
         except Exception:
             pass
         return False
@@ -178,7 +234,7 @@ class AndroidEngine:
     def set_volume(self, v):
         self.volume = v
         if self.mp:
-            self.mp.setVolume(v, v)
+            self.mp.setVolume(v * self._duck, v * self._duck)
 
     def set_speed(self, v):
         self.speed = v
@@ -1514,6 +1570,9 @@ class PlayerApp(App):
         self.dl_cancel = False
         self._popup = None
         self.engine = AndroidEngine() if ON_ANDROID else DesktopEngine()
+        self._focus_paused = False
+        if ON_ANDROID:
+            self.engine.on_focus = self.on_focus_change
         self.load()
         global ICON_DIR
         ICON_DIR = ensure_icons(Path(self.user_data_dir) / "icons")
@@ -1540,7 +1599,40 @@ class PlayerApp(App):
 
     def on_stop(self):
         self.dl_cancel = True
+        if ON_ANDROID:
+            self.engine.on_focus = None
+            self.engine.abandon_focus()
         self.engine.release()
+
+    def on_resume(self):
+        try:
+            if self.engine.loaded:
+                self.tick(0)
+        except Exception:
+            pass
+
+    # ---------- аудиофокус (Телеграм, звонки, другие плееры) ----------
+    def on_focus_change(self, change):
+        # вызывается из потока Java — переносим в основной поток Kivy
+        Clock.schedule_once(lambda dt: self._focus(change), 0)
+
+    def _focus(self, change):
+        try:
+            if change in (-1, -2):                  # потеряли звук (насовсем / ненадолго)
+                if self.playing:
+                    self._focus_paused = change == -2
+                    self.engine.pause()
+                    self.set_playing(False)
+            elif change == -3:                      # можно тише (уведомление)
+                self.engine.set_duck(True)
+            elif change == 1:                       # звук вернули
+                self.engine.set_duck(False)
+                if self._focus_paused and not self.playing and self.engine.loaded:
+                    self._focus_paused = False
+                    self.engine.start()
+                    self.set_playing(True)
+        except Exception:
+            pass
 
     def ask_permissions(self):
         if not ON_ANDROID:
@@ -2065,6 +2157,7 @@ class PlayerApp(App):
         self.root.ids.mini.ids.mplay.pop()
 
     def toggle_play(self):
+        self._focus_paused = False
         if self.playing:
             self.engine.pause()
             self.set_playing(False)
@@ -2135,6 +2228,12 @@ class PlayerApp(App):
             return
         if e.ended():
             self.on_end()
+            return
+        if getattr(e, "stalled", False):
+            e.stalled = False
+            if self.playing:
+                self._focus_paused = True
+                self.set_playing(False)
             return
         if self.seeking:
             return
