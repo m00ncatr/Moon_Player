@@ -246,5 +246,17 @@ ICONS["note"](nd)
 alpha = note.getchannel("A").resize((300, 300), Image.LANCZOS)
 dark = Image.new("RGBA", (300, 300), (6, 33, 15, 255))
 big.paste(dark, (106, 106), alpha)
-big.save(os.path.join(OUT, "..", "icon.png"))
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+big.save(os.path.join(ROOT, "icon.png"))
+
+import base64
+with open(os.path.join(ROOT, "icons_data.py"), "w", encoding="utf-8") as f:
+    f.write('"""Иконки приложения (PNG в base64). Создано tools/gen_icons.py."""\nICONS_B64 = {\n')
+    for name in sorted(ICONS):
+        v = base64.b64encode(open(os.path.join(OUT, name + ".png"), "rb").read()).decode()
+        f.write(f'    "{name}": (\n')
+        for i in range(0, len(v), 96):
+            f.write(f'        "{v[i:i+96]}"\n')
+        f.write("    ),\n")
+    f.write("}\n")
 print("готово:", len(ICONS), "иконок")

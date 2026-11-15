@@ -4,7 +4,8 @@ package.name = myplayer
 package.domain = org.myplayer
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
-source.exclude_dirs = tools,bin,.buildozer,__pycache__
+source.exclude_dirs = tools,assets,bin,.buildozer,__pycache__
+source.exclude_patterns = gen_icons.py
 version = 1.0
 # Версии зафиксированы: новый python-for-android (master) собирает на Python 3.14,
 # с которым Kivy 2.3.0 не компилируется. Здесь взята связка с Python 3.11.
@@ -12,7 +13,7 @@ requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,pyjnius,android,c
 p4a.branch = v2024.01.21
 orientation = portrait
 fullscreen = 0
-icon.filename = %(source.dir)s/assets/icon.png
+icon.filename = %(source.dir)s/icon.png
 
 # доступ к музыке на телефоне, интернет для скачивания, не засыпать при игре
 android.permissions = INTERNET,READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,WAKE_LOCK

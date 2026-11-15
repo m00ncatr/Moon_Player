@@ -45,7 +45,7 @@ except Exception:          # без mutagen просто не будет вст�
 
 ON_ANDROID = platform == "android"
 BASE = os.path.dirname(os.path.abspath(__file__))
-ICON_DIR = os.path.join(BASE, "assets", "icons")
+ICON_DIR = os.path.join(BASE, "assets", "icons")   # на старте заменяется на папку приложения
 AUDIO_EXT = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus"}
 SPEEDS = [0.75, 1.0, 1.25, 1.5, 2.0]
 LOOP_ICONS = [("repeat", [0.74, 0.74, 0.74, 1]), ("repeat", [0.118, 0.843, 0.376, 1]),
@@ -60,6 +60,17 @@ DIM = [0.68, 0.68, 0.7, 1]
 
 def icon_path(name):
     return os.path.join(ICON_DIR, name + ".png")
+
+
+def ensure_icons(dest):
+    """Иконки лежат в icons_data.py (base64): записываем их файлами и возвращаем папку."""
+    from base64 import b64decode
+    from icons_data import ICONS_B64
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for name, b64 in ICONS_B64.items():
+        (dest / (name + ".png")).write_bytes(b64decode(b64))
+    return str(dest)
 
 
 def fmt_time(sec):
@@ -1461,6 +1472,8 @@ class PlayerApp(App):
         self._popup = None
         self.engine = AndroidEngine() if ON_ANDROID else DesktopEngine()
         self.load()
+        global ICON_DIR
+        ICON_DIR = ensure_icons(Path(self.user_data_dir) / "icons")
         root = Builder.load_string(KV)
         self.lib, self.ply = root.ids.lib, root.ids.ply
         self.onl, self.dev = root.ids.onl, root.ids.dev

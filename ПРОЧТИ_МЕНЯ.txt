@@ -1,11 +1,11 @@
-Сборка APK без Ubuntu (через GitHub)
+Сборка APK через GitHub
 
-1. Зарегистрируйся на github.com и создай новый репозиторий (New repository).
-2. Нажми "uploading an existing file" и перетащи ВСЁ содержимое этой папки
-   (main.py, buildozer.spec, assets, tools, папку .github).
-   Если папка .github не загрузилась: Add file -> Create new file, имя файла
-   .github/workflows/build.yml  и вставь туда текст из файла build.yml.
-3. Открой вкладку Actions -> "Build APK". Сборка стартует сама (или кнопка Run workflow).
-   Первая сборка идёт 20-40 минут.
-4. Когда появится зелёная галочка, открой запуск и внизу в разделе Artifacts
-   скачай "myplayer-apk". Внутри лежит .apk — скинь на телефон и установи.
+Нужные файлы (все лежат прямо в корне репозитория, папки для работы не нужны):
+  main.py, icons_data.py, icon.png, buildozer.spec
+  .github/workflows/build.yml   (запускает сборку)
+Папка tools не обязательна.
+
+1. Загрузи эти файлы в репозиторий (Add file -> Upload files).
+   Старые файлы с такими же именами будут заменены.
+2. Вкладка Actions -> Run workflow. Сборка 20-40 минут.
+3. Внизу запуска в разделе Artifacts скачай .apk, скинь на телефон и установи.
