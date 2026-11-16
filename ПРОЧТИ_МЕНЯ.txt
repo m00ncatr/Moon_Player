@@ -2,7 +2,7 @@
 
 Нужные файлы (все лежат прямо в корне репозитория, папки для работы не нужны):
   main.py, icons_data.py, icon.png, buildozer.spec
-  .github/workflows/build.yml   (запускает сборку)
+  .github/workflows/main.yml   (запускает сборку)
 Папка tools не обязательна.
 
 1. Загрузи эти файлы в репозиторий (Add file -> Upload files).

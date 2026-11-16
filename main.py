@@ -8,9 +8,12 @@ import json
 import math
 import os
 import re
+import random
 import shutil
 import ssl
 import threading
+import time
+import traceback
 import uuid
 import urllib.request
 from io import BytesIO
@@ -19,12 +22,15 @@ from urllib.parse import urlencode, quote, urlparse, unquote
 
 from kivy.animation import Animation
 from kivy.app import App
+from kivy.base import ExceptionHandler, ExceptionManager
 from kivy.clock import Clock, mainthread
 from kivy.core.image import Image as CoreImage
 from kivy.core.window import Window
-from kivy.graphics import Color, Line, Rectangle, RoundedRectangle
+from kivy.graphics import (Color, Ellipse, Line, Mesh, PopMatrix, PushMatrix, Rectangle,
+                           RoundedRectangle, Rotate)
 from kivy.graphics.texture import Texture
 from kivy.lang import Builder
+from kivy.logger import Logger
 from kivy.metrics import dp, sp
 from kivy.properties import (BooleanProperty, ListProperty, NumericProperty,
                              ObjectProperty, StringProperty)
@@ -36,7 +42,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.screenmanager import Screen, SlideTransition
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
-from kivy.utils import platform
+from kivy.utils import get_color_from_hex, platform
 
 try:
     import mutagen
@@ -56,6 +62,16 @@ TITLES = {"library": "Плейлисты", "player": "Сейчас играет"
 GREEN = [0.118, 0.843, 0.376, 1]
 LIGHT = [0.92, 0.92, 0.92, 1]
 DIM = [0.68, 0.68, 0.7, 1]
+RICK_URL = "https://www.youtube.com/watch?v=hvL1339luv0"
+BG_MODES = [("blobs", "Светящиеся огни"), ("aurora", "Северное сияние"),
+            ("stars", "Звёздное небо"), ("plain", "Спокойный градиент"),
+            ("image", "Своя картинка")]
+BG_DEFAULT = {"mode": "blobs", "dim": 25, "speed": 100, "image": ""}
+SITES = [("Jamendo — получить бесплатный API-ключ", "https://devportal.jamendo.com/"),
+         ("Wikimedia Commons — аудио", "https://commons.wikimedia.org/wiki/Category:Audio_files"),
+         ("Jamendo (музыка с разрешения авторов)", "https://www.jamendo.com/start"),
+         ("Musopen (классика, общественное достояние)", "https://musopen.org/"),
+         ("Internet Archive — аудио", "https://archive.org/details/audio")]
 
 
 def icon_path(name):
@@ -475,7 +491,107 @@ def ia_tracks(ident):
     return pick(".mp3") or pick(".ogg")
 
 
-def import_android_image(uri, dest):
+def open_url(url):
+    """Открывает ссылку в браузере телефона (или компьютера)."""
+    try:
+        if ON_ANDROID:
+            from jnius import autoclass
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            act.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        else:
+            import webbrowser
+            webbrowser.open(url)
+    except Exception:
+        Logger.exception("Player: не удалось открыть ссылку")
+
+
+def wc_search(text):
+    """Аудиофайлы на Wikimedia Commons -> [(подпись, заголовок файла)]."""
+    q = re.sub(r"[^\w\s]", " ", text).strip()
+    if not q:
+        return []
+    params = urlencode([("action", "query"), ("list", "search"),
+                        ("srsearch", q + " filetype:audio"), ("srnamespace", "6"),
+                        ("srlimit", "40"), ("format", "json")])
+    found = http_json("https://commons.wikimedia.org/w/api.php?" + params)
+    out = []
+    for r in found.get("query", {}).get("search", []):
+        name = r["title"].split(":", 1)[-1].rsplit(".", 1)[0].replace("_", " ")
+        out.append((name, r["title"]))
+    return out
+
+
+def wc_tracks(title):
+    """Прямая ссылка на файл с Commons -> [(подпись, {"url","name"})]."""
+    params = urlencode([("action", "query"), ("titles", title), ("prop", "imageinfo"),
+                        ("iiprop", "url|size"), ("format", "json")])
+    pages = http_json("https://commons.wikimedia.org/w/api.php?" + params)
+    out = []
+    for pg in pages.get("query", {}).get("pages", {}).values():
+        for ii in pg.get("imageinfo", []):
+            url = ii.get("url")
+            if not url:
+                continue
+            name = unquote(Path(urlparse(url).path).name)
+            if name.lower().endswith(".oga"):
+                name = name[:-4] + ".ogg"
+            label = name.rsplit(".", 1)[0].replace("_", " ")
+            if ii.get("size"):
+                label += f"  ({ii['size'] / 1048576:.1f} МБ)"
+            out.append((label, {"url": url, "name": name}))
+    return out
+
+
+JAMENDO = {"id": ""}   # client_id; хранится в настройках плеера
+
+
+def jamendo_get(path, **params):
+    if not JAMENDO["id"]:
+        raise RuntimeError("не задан ключ Jamendo (client_id)")
+    q = urlencode([("client_id", JAMENDO["id"]), ("format", "json")] + list(params.items()))
+    data = http_json(f"https://api.jamendo.com/v3.0/{path}/?{q}")
+    head = data.get("headers", {})
+    if head.get("status") != "success":
+        raise RuntimeError(head.get("error_message") or "Jamendo отклонил запрос (проверь ключ client_id)")
+    return data.get("results", [])
+
+
+def jm_search(text):
+    res = jamendo_get("tracks", search=text, limit=40, audioformat="mp32")
+    return [(f"{t.get('name', '?')} — {t.get('artist_name', '')}", str(t["id"])) for t in res]
+
+
+def jm_tracks(ident):
+    out = []
+    for t in jamendo_get("tracks", id=ident, audioformat="mp32"):
+        url = t.get("audiodownload") if t.get("audiodownload_allowed") else None
+        url = url or t.get("audio")
+        if not url:
+            continue
+        title = t.get("name") or "track"
+        dur = int(t.get("duration") or 0)
+        name = f"{t.get('artist_name', '')} - {title}.mp3".strip(" -")
+        out.append((f"{title}  ({dur // 60}:{dur % 60:02d})", {"url": url, "name": name}))
+    return out
+
+
+# (название, функция поиска, функция списка треков, подсказка)
+SOURCES = [
+    ("Internet Archive", ia_search, ia_tracks,
+     "Поиск бесплатной музыки (Internet Archive). Скачивай только то, "
+     "что автор разрешил: свободные лицензии, общественное достояние."),
+    ("Wikimedia Commons", wc_search, wc_tracks,
+     "Аудио на Wikimedia Commons: всё там под свободными лицензиями (CC, "
+     "общественное достояние). Хорошо находятся классика, народная музыка и звуки."),
+    ("Jamendo", jm_search, jm_tracks,
+     "Jamendo: музыка независимых артистов по лицензиям Creative Commons. "
+     "Нужен бесплатный ключ client_id (спросим при первом поиске)."),
+]
+
+
+def import_android_image(uri, dest, max_side=1400):
     """Копирует фото из галереи в файл dest (JPEG, не больше ~1400 px, с учётом поворота)."""
     from jnius import autoclass
     act = autoclass("org.kivy.android.PythonActivity").mActivity
@@ -495,7 +611,7 @@ def import_android_image(uri, dest):
     if w <= 0 or h <= 0:
         raise RuntimeError("это не картинка")
     sample = 1
-    while max(w, h) / sample > 1400:
+    while max(w, h) / sample > max_side:
         sample *= 2
     opts2 = Options()
     opts2.inSampleSize = sample
@@ -571,33 +687,197 @@ def scan_audio():
 
 
 # ====================== виджеты ======================
+def _vertical_texture(n=64):
+    tex = Texture.create(size=(1, n), colorfmt="rgba")
+    tex.mag_filter = "linear"
+    return tex
+
+
+def make_glow_texture():
+    """Мягкое белое пятно (центр непрозрачный, к краю растворяется)."""
+    n = 64
+    c = (n - 1) / 2
+    buf = bytearray()
+    for y in range(n):
+        for x in range(n):
+            a = max(0.0, 1.0 - math.hypot(x - c, y - c) / c)
+            a = a * a * (3 - 2 * a)
+            buf += b"\xff\xff\xff" + bytes((int(a * 255),))
+    tex = Texture.create(size=(n, n), colorfmt="rgba")
+    tex.mag_filter = "linear"
+    tex.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+    return tex
+
+
+def make_band_texture():
+    """Вертикальная полоса для северного сияния: прозрачная сверху и снизу."""
+    n = 64
+    buf = bytearray()
+    for i in range(n):                      # строка 0 — низ полосы
+        pos = 1 - i / (n - 1)               # 0 — верх, 1 — низ
+        a = pos / 0.35 * 0.37 if pos < 0.35 else (1 - pos) / 0.65 * 0.37
+        buf += b"\xff\xff\xff" + bytes((int(max(0.0, a) * 255),))
+    tex = _vertical_texture(n)
+    tex.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+    return tex
+
+
 class Background(Widget):
-    """Вертикальный градиент в цвете обложки (цвет меняется плавно)."""
+    """Фон: светящиеся огни, северное сияние, звёзды, градиент или своя картинка
+    + затемнение. Цвет подстраивается под обложку."""
     accent = ListProperty([0.16, 0.16, 0.27, 1])
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        self.tex = Texture.create(size=(1, 64), colorfmt="rgba")
-        self.tex.mag_filter = "linear"
-        with self.canvas:
-            Color(1, 1, 1, 1)
-            self.rect = Rectangle(texture=self.tex, pos=self.pos, size=self.size)
-        self.bind(pos=self._place, size=self._place, accent=self._paint)
-        self._paint()
+        self.mode, self.dim, self.speed = "blobs", 0.25, 1.0
+        self.t = 0.0
+        self.shoot = None
+        self.img_tex = None
+        self._img_path = None
+        self._img_region = None
+        self.grad = _vertical_texture()
+        self.grad_stars = _vertical_texture()
+        self.glow = make_glow_texture()
+        self.band = make_band_texture()
+        self.stars = [[random.random(), random.random(), random.uniform(0.6, 2.0),
+                       random.uniform(0.5, 1.6), random.uniform(0, 6.28)] for _ in range(110)]
+        self._paint_gradients()
+        self.bind(pos=self.redraw, size=self.redraw, accent=self._accent_changed)
+        Clock.schedule_interval(self.tick, 1 / 30)
+        self.redraw()
 
-    def _place(self, *a):
-        self.rect.pos, self.rect.size = self.pos, self.size
+    # ----- настройки -----
+    def apply(self, cfg):
+        self.mode = cfg.get("mode", "blobs")
+        self.dim = max(0, min(90, cfg.get("dim", 25))) / 100
+        self.speed = max(0, cfg.get("speed", 100)) / 100
+        img = cfg.get("image") or ""
+        if img != self._img_path:
+            self._img_path = img
+            self.img_tex = None
+            self._img_region = None
+            if img and os.path.exists(img):
+                try:
+                    self.img_tex = CoreImage(img).texture
+                except Exception:
+                    Logger.exception("Player: не удалось загрузить обои")
+        self.redraw()
 
-    def _paint(self, *a):
-        r, g, b = self.accent[:3]
-        dark = (16 / 255, 16 / 255, 20 / 255)
+    def _accent_changed(self, *a):
+        self._paint_gradients()
+        self.redraw()
+
+    def _fill(self, tex, top, bottom, split):
         buf = bytearray()
-        for i in range(64):                  # строка 0 — низ, 63 — верх
-            m = max(0.0, (i / 63 - 0.2) / 0.8)
-            buf += bytes(int((dark[k] * (1 - m) + (r, g, b)[k] * m) * 255) for k in range(3))
+        for i in range(64):                 # строка 0 — низ, 63 — верх
+            m = max(0.0, (i / 63 - split) / (1 - split))
+            buf += bytes(int((bottom[k] * (1 - m) + top[k] * m) * 255) for k in range(3))
             buf += b"\xff"
-        self.tex.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
-        self.canvas.ask_update()
+        tex.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+
+    def _paint_gradients(self):
+        r, g, b = self.accent[:3]
+        self._fill(self.grad, (r, g, b), (16 / 255, 16 / 255, 20 / 255), 0.2)
+        h, s, _v = colorsys.rgb_to_hsv(r, g, b)
+        low = colorsys.hsv_to_rgb(h, min(s, 200 / 255), 80 / 255)
+        self._fill(self.grad_stars, (5 / 255, 7 / 255, 20 / 255), low, 0.0)
+
+    # ----- анимация -----
+    def tick(self, dt):
+        if self.speed <= 0.01 or self.mode not in ("blobs", "aurora", "stars") or self.width < 2:
+            return
+        self.t += 0.9 * dt * self.speed
+        if self.mode == "stars":
+            k = dt * 30 * self.speed
+            if self.shoot:
+                x, y, vx, vy, life = self.shoot
+                self.shoot = [x + vx * k, y + vy * k, vx, vy, life - 0.02 * k]
+                if self.shoot[4] <= 0:
+                    self.shoot = None
+            elif random.random() < 0.006 * dt * 30:
+                u = dp(1)
+                self.shoot = [random.uniform(0.3, 1.0) * self.width,
+                              random.uniform(0.0, 0.4) * self.height,
+                              -random.uniform(9, 14) * u, random.uniform(4, 7) * u, 1.0]
+        self.redraw()
+
+    # ----- рисование -----
+    def _cover_texture(self, w, h):
+        key = (int(w), int(h), self._img_path)
+        if self._img_region is None or self._img_region[0] != key:
+            iw, ih = self.img_tex.size
+            k = max(w / iw, h / ih)
+            sw, sh = w / k, h / k
+            reg = self.img_tex.get_region(int((iw - sw) / 2), int((ih - sh) / 2),
+                                          max(1, int(sw)), max(1, int(sh)))
+            self._img_region = (key, reg)
+        return self._img_region[1]
+
+    def redraw(self, *a):
+        c = self.canvas
+        c.clear()
+        w, h = self.width, self.height
+        if w < 2 or h < 2:
+            return
+        with c:
+            if self.mode == "image" and self.img_tex is not None:
+                Color(1, 1, 1, 1)
+                Rectangle(texture=self._cover_texture(w, h), pos=self.pos, size=self.size)
+            else:
+                self._procedural(w, h)
+            if self.dim > 0:
+                Color(0, 0, 0, self.dim)
+                Rectangle(pos=self.pos, size=self.size)
+
+    def _procedural(self, w, h):
+        top = self.top
+        hue = colorsys.rgb_to_hsv(*self.accent[:3])[0] * 360
+        Color(1, 1, 1, 1)
+        Rectangle(texture=self.grad_stars if self.mode == "stars" else self.grad,
+                  pos=self.pos, size=self.size)
+        t = self.t
+        if self.mode == "blobs":
+            for i, (fx, fy, ph) in enumerate([(0.5, 0.7, 0.0), (0.8, 0.45, 2.1), (0.35, 0.9, 4.2)]):
+                cx = self.x + w * (0.5 + 0.42 * math.sin(t * fx + ph))
+                cy = top - h * (0.5 + 0.38 * math.cos(t * fy + ph * 1.3))
+                rad = min(w, h) * 0.4
+                r, g, b = colorsys.hsv_to_rgb(((hue + i * 35) % 360) / 360, 170 / 255, 1.0)
+                Color(r, g, b, 70 / 255)
+                Rectangle(texture=self.glow, pos=(cx - rad, cy - rad), size=(2 * rad, 2 * rad))
+        elif self.mode == "aurora":
+            step = max(dp(14), w / 48)
+            n = int(w // step) + 2
+            u = dp(1)
+            for i in range(4):
+                base, amp, band = h * (0.18 + 0.13 * i), h * 0.06, h * 0.3
+                r, g, b = colorsys.hsv_to_rgb(((hue + 90 + i * 45) % 360) / 360, 200 / 255, 1.0)
+                Color(r, g, b, 1)
+                verts = []
+                for j in range(n):
+                    x = j * step
+                    xs = x / u
+                    y = (base + amp * math.sin(xs * 0.008 + t * (0.7 + 0.2 * i) + i * 1.7)
+                         + amp * 0.5 * math.sin(xs * 0.017 - t * 0.9 + i))
+                    verts += [self.x + x, top - y, 0, 1, self.x + x, top - (y + band), 0, 0]
+                Mesh(vertices=verts, indices=list(range(2 * n)), mode="triangle_strip",
+                     texture=self.band)
+        elif self.mode == "stars":
+            u = dp(0.9)
+            for sx, sy, sz, sp_, ph in self.stars:
+                x = ((sx + t * 0.004 * sp_) % 1.0) * w
+                a = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 1.6 * sp_ + ph))
+                r = sz * u
+                Color(1, 1, 1, a)
+                Ellipse(pos=(self.x + x - r, top - sy * h - r), size=(2 * r, 2 * r))
+            if self.shoot:
+                x, y, vx, vy, life = self.shoot
+                segs = 6
+                for k in range(segs):
+                    f0, f1 = k / segs, (k + 1) / segs
+                    Color(1, 1, 1, 0.9 * life * (1 - f0))
+                    Line(points=[self.x + x - vx * 8 * f0, top - (y - vy * 8 * f0),
+                                 self.x + x - vx * 8 * f1, top - (y - vy * 8 * f1)],
+                         width=dp(1.5))
 
 
 class Glyph(Widget):
@@ -756,6 +1036,7 @@ class CoverView(Widget):
         super().__init__(**kw)
         self.tex = placeholder_cover("music")[0]
         self._ring_ev = None
+        self.parts = []            # искры, летящие от краёв обложки
         self.bind(pos=self.redraw, size=self.redraw, fade=self.redraw, scale=self.redraw,
                   ring=self.redraw, phase=self.redraw, tex=self.redraw)
         self.redraw()
@@ -794,6 +1075,10 @@ class CoverView(Widget):
                     Color(*self.ring_color[:3], 0.6 * (1 - ph) * self.ring)
                     Line(rounded_rectangle=(x - grow, y - grow, side + 2 * grow,
                                             side + 2 * grow, rad + grow), width=dp(2))
+            for px, py, _vx, _vy, life, sz in self.parts:   # светящиеся искры
+                Color(*self.ring_color[:3], 0.82 * life)
+                r = sz * life + dp(0.8)
+                Ellipse(pos=(px - r, py - r), size=(2 * r, 2 * r))
 
     def set_cover(self, tex, placeholder):
         self.old = self.tex
@@ -834,9 +1119,42 @@ class CoverView(Widget):
 
     def _ring_tick(self, dt):
         self.phase = (self.phase + dt / 1.8) % 1
+        self._tick_particles()
         if not self.playing and self.ring < 0.01 and self._ring_ev is not None:
             self._ring_ev.cancel()
             self._ring_ev = None
+            self.parts.clear()
+
+    def _tick_particles(self):
+        """Пока играет музыка, от краёв обложки поднимаются искры."""
+        k = dp(2)
+        if self.playing and random.random() < 0.4:
+            half = min(self.width, self.height) * 0.9 * self.scale / 2
+            cx, cy = self.center_x, self.center_y
+            side = random.choice((0, 1, 2))
+            if side == 0:
+                x, y = cx + random.uniform(-half, half), cy - half
+            elif side == 1:
+                x, y = cx - half, cy + random.uniform(-half, half)
+            else:
+                x, y = cx + half, cy + random.uniform(-half, half)
+            self.parts.append([x, y, random.uniform(-0.5, 0.5) * k, random.uniform(0.6, 1.8) * k,
+                               1.0, random.uniform(2.0, 4.5) * dp(1)])
+        for q in self.parts:
+            q[0] += q[2]
+            q[1] += q[3]
+            q[4] -= 0.024
+        self.parts = [q for q in self.parts if q[4] > 0]
+
+    def on_touch_down(self, touch):
+        """Тап по обложке — она подпрыгивает."""
+        if self.scale > 0.1 and self.collide_point(*touch.pos):
+            self.bump()
+            app = App.get_running_app()
+            if app is not None:
+                app.cover_tapped()
+            return True
+        return super().on_touch_down(touch)
 
 
 class Equalizer(Widget):
@@ -890,6 +1208,74 @@ class Equalizer(Widget):
                     cy = min(self.height - dp(3), self.pk[i] * self.height + dp(3))
                     RoundedRectangle(pos=(self.x + i * w + dp(1), self.y + cy),
                                      size=(w - dp(2), dp(3)), radius=[dp(1.5)])
+
+
+class ModeChip(RoundButton):
+    active = BooleanProperty(False)
+
+
+class Confetti(Widget):
+    """Салют из конфетти поверх всего экрана (когда скачивание закончилось)."""
+    COLORS = ["#1ed760", "#ff5c8a", "#ffd23f", "#4cc9f0", "#b388ff", "#ff9f1c"]
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.parts = []
+        self._ev = None
+
+    def burst(self, n=90):
+        k = dp(1)
+        w, h = self.size
+        for _ in range(n):
+            ang = random.uniform(math.pi * 0.08, math.pi * 0.92)
+            sp_ = random.uniform(7, 17) * k
+            self.parts.append([w / 2 + random.uniform(-60, 60) * k, h * 0.2,
+                               math.cos(ang) * sp_, math.sin(ang) * sp_,
+                               random.uniform(0, 6.28), random.uniform(-0.35, 0.35),
+                               get_color_from_hex(random.choice(self.COLORS)),
+                               random.uniform(6, 11) * k, 1.0])
+        if self._ev is None:
+            self._ev = Clock.schedule_interval(self.tick, 1 / 30)
+
+    def tick(self, dt):
+        s = dt * 60                    # шаги «как на компьютере» за один кадр
+        g = 0.33 * dp(1)
+        for q in self.parts:
+            q[0] += q[2] * s
+            q[1] += q[3] * s
+            q[3] -= g * s
+            q[2] *= 0.985 ** s
+            q[4] += q[5] * s
+            q[8] -= 0.007 * s
+        self.parts = [q for q in self.parts if q[8] > 0 and q[1] > -dp(40)]
+        self.canvas.clear()
+        with self.canvas:
+            for x, y, _vx, _vy, rot, _vr, col, sz, life in self.parts:
+                PushMatrix()
+                Rotate(angle=math.degrees(rot), origin=(x, y))
+                Color(col[0], col[1], col[2], min(1.0, life * 2))
+                Rectangle(pos=(x - sz / 2, y - sz / 4), size=(sz, sz / 2))
+                PopMatrix()
+        if not self.parts and self._ev is not None:
+            self._ev.cancel()
+            self._ev = None
+
+
+class SafeHandler(ExceptionHandler):
+    """Ошибка в обработчике больше не закрывает приложение: пишем её в журнал и идём дальше."""
+
+    def handle_exception(self, inst):
+        if isinstance(inst, (KeyboardInterrupt, SystemExit)):
+            return ExceptionManager.RAISE
+        try:
+            tb = "".join(traceback.format_exception(type(inst), inst, inst.__traceback__))
+            Logger.error("Player: необработанная ошибка:\n" + tb)
+            app = App.get_running_app()
+            if app is not None:
+                app.report_error(tb)
+        except Exception:
+            pass
+        return ExceptionManager.PASS
 
 
 class LibraryScreen(Screen):
@@ -977,6 +1363,10 @@ KV = """
 <Chip>:
     size_hint: None, 1
     width: self.label_w + dp(36)
+    bg: GREEN if self.active else (1, 1, 1, 0.12)
+    fg: (0, 0, 0, 1) if self.active else LIGHT
+
+<ModeChip>:
     bg: GREEN if self.active else (1, 1, 1, 0.12)
     fg: (0, 0, 0, 1) if self.active else LIGHT
 
@@ -1340,6 +1730,26 @@ KV = """
                 tint: 0, 0, 0, 1
                 corner: 12
                 on_release: app.online_search(q.text)
+        ScrollView:
+            size_hint_y: None
+            height: dp(40)
+            do_scroll_y: False
+            bar_width: 0
+            BoxLayout:
+                id: srcs
+                size_hint_x: None
+                width: self.minimum_width
+                spacing: dp(8)
+                padding: 0, dp(2)
+        Label:
+            id: hint
+            text: app.src_hint
+            color: DIM
+            font_size: sp(12)
+            size_hint_y: None
+            text_size: self.width, None
+            height: self.texture_size[1]
+            halign: 'left'
         BoxLayout:
             size_hint_y: None
             height: dp(34)
@@ -1357,6 +1767,12 @@ KV = """
                 text_size: self.size
                 halign: 'left'
                 valign: 'middle'
+            IconButton:
+                size_hint: None, 1
+                width: dp(40)
+                source: 'globe'
+                tint: DIM
+                on_release: app.sites_menu()
         RecycleView:
             id: rv
             viewclass: 'PickRow'
@@ -1437,35 +1853,165 @@ KV = """
 
 <SettingsScreen>:
     name: 'settings'
-    BoxLayout:
-        orientation: 'vertical'
-        padding: dp(16), dp(8)
-        spacing: dp(12)
-        Label:
-            text: 'ОБЛОЖКИ'
-            color: DIM
-            bold: True
-            font_size: sp(12)
+    ScrollView:
+        do_scroll_x: False
+        bar_width: dp(3)
+        BoxLayout:
+            orientation: 'vertical'
             size_hint_y: None
-            height: dp(22)
-            text_size: self.size
-            halign: 'left'
-            valign: 'middle'
-        RoundButton:
-            size_hint_y: None
-            height: dp(54)
-            text: 'Сменить обложку альбома'
-            icon: 'image'
-            on_release: app.choose_album_for_cover()
-        Label:
-            text: 'Выбери альбом, потом фото из галереи.\\nОбложку отдельного трека можно сменить в его меню (три точки).'
-            color: DIM
-            font_size: sp(13)
-            size_hint_y: None
-            text_size: self.width, None
-            height: self.texture_size[1]
-            halign: 'left'
-        Widget:
+            height: self.minimum_height
+            padding: dp(16), dp(8), dp(16), dp(24)
+            spacing: dp(12)
+            Label:
+                text: 'ФОН ПЛЕЕРА'
+                color: DIM
+                bold: True
+                font_size: sp(12)
+                size_hint_y: None
+                height: dp(22)
+                text_size: self.size
+                halign: 'left'
+                valign: 'middle'
+            GridLayout:
+                id: modes
+                cols: 2
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(8)
+            RoundButton:
+                size_hint_y: None
+                height: dp(48)
+                text: 'Выбрать картинку для фона'
+                icon: 'image'
+                on_release: app.pick_bg_image()
+            Label:
+                text: app.bg_file_text
+                color: DIM
+                font_size: sp(13)
+                size_hint_y: None
+                text_size: self.width, None
+                height: self.texture_size[1] if self.text else 0
+                halign: 'left'
+            BoxLayout:
+                size_hint_y: None
+                height: dp(44)
+                Label:
+                    text: 'Затемнение'
+                    size_hint_x: None
+                    width: dp(110)
+                    color: LIGHT
+                    text_size: self.size
+                    halign: 'left'
+                    valign: 'middle'
+                Slider:
+                    id: dim_sl
+                    min: 0
+                    max: 90
+                    step: 1
+                    value_track: True
+                    value_track_color: GREEN
+                    cursor_size: dp(22), dp(22)
+                    on_value: app.on_bg_slider('dim', self.value)
+                Label:
+                    text: app.bg_dim_text
+                    size_hint_x: None
+                    width: dp(52)
+                    color: DIM
+            BoxLayout:
+                size_hint_y: None
+                height: dp(44)
+                Label:
+                    text: 'Скорость'
+                    size_hint_x: None
+                    width: dp(110)
+                    color: LIGHT
+                    text_size: self.size
+                    halign: 'left'
+                    valign: 'middle'
+                Slider:
+                    id: speed_sl
+                    min: 0
+                    max: 200
+                    step: 1
+                    value_track: True
+                    value_track_color: GREEN
+                    cursor_size: dp(22), dp(22)
+                    on_value: app.on_bg_slider('speed', self.value)
+                Label:
+                    text: app.bg_speed_text
+                    size_hint_x: None
+                    width: dp(52)
+                    color: DIM
+            RoundButton:
+                size_hint_y: None
+                height: dp(46)
+                text: 'Сбросить фон'
+                icon: 'close'
+                on_release: app.reset_bg()
+            Label:
+                text: 'ОБЛОЖКИ'
+                color: DIM
+                bold: True
+                font_size: sp(12)
+                size_hint_y: None
+                height: dp(30)
+                text_size: self.size
+                halign: 'left'
+                valign: 'bottom'
+            RoundButton:
+                size_hint_y: None
+                height: dp(54)
+                text: 'Сменить обложку альбома'
+                icon: 'image'
+                on_release: app.choose_album_for_cover()
+            Label:
+                text: 'Выбери альбом, потом фото из галереи.\\nОбложку отдельного трека можно сменить в его меню (три точки). Тап по обложке на экране плеера — она подпрыгивает.'
+                color: DIM
+                font_size: sp(13)
+                size_hint_y: None
+                text_size: self.width, None
+                height: self.texture_size[1]
+                halign: 'left'
+            Label:
+                text: 'ЗАГРУЗКА МУЗЫКИ'
+                color: DIM
+                bold: True
+                font_size: sp(12)
+                size_hint_y: None
+                height: dp(30)
+                text_size: self.size
+                halign: 'left'
+                valign: 'bottom'
+            RoundButton:
+                size_hint_y: None
+                height: dp(50)
+                text: 'Ключ Jamendo'
+                icon: 'settings'
+                on_release: app.ask_jamendo_key(None)
+            Label:
+                text: app.jamendo_text
+                color: DIM
+                font_size: sp(13)
+                size_hint_y: None
+                text_size: self.width, None
+                height: self.texture_size[1]
+                halign: 'left'
+            Label:
+                text: 'ПРОЧЕЕ'
+                color: DIM
+                bold: True
+                font_size: sp(12)
+                size_hint_y: None
+                height: dp(30)
+                text_size: self.size
+                halign: 'left'
+                valign: 'bottom'
+            RoundButton:
+                size_hint_y: None
+                height: dp(46)
+                text: 'Журнал ошибок'
+                icon: 'list'
+                on_release: app.show_error_log()
 
 FloatLayout:
     Background:
@@ -1533,6 +2079,8 @@ FloatLayout:
                 on_release: app.go('settings')
     Toast:
         id: toast
+    Confetti:
+        id: confetti
 """
 
 
@@ -1552,15 +2100,29 @@ class PlayerApp(App):
     online_stage = StringProperty("results")
     dev_status = StringProperty("")
     ind = NumericProperty(0)
+    src_hint = StringProperty("")
+    bg_dim_text = StringProperty("")
+    bg_speed_text = StringProperty("")
+    bg_file_text = StringProperty("")
+    jamendo_text = StringProperty("")
 
     # ---------- запуск ----------
     def build(self):
         self.title = "Мой плеер"
+        self.last_error = ""
+        self._bg_loading = True          # пока строится интерфейс, ползунки ничего не сохраняют
+        ExceptionManager.add_handler(SafeHandler())   # ошибки больше не закрывают приложение
         Window.clearcolor = (0.06, 0.06, 0.08, 1)
         Window.softinput_mode = "below_target"
         if not ON_ANDROID:
             Window.size = (420, 820)
-        self.data = {"playlists": {"Моя музыка": []}, "titles": {}, "covers": {}, "track_covers": {}}
+        self.data = {"playlists": {"Моя музыка": []}, "titles": {}, "covers": {}, "track_covers": {},
+                     "bg": dict(BG_DEFAULT), "jamendo_id": ""}
+        self.cur_src = 0
+        self._dots_ev, self._dots_base, self._dots_i = None, "", 0
+        self._rick_resume, self._cover_taps = False, []
+        self._save_ev = None
+        self._mode_chips, self._src_chips = {}, []
         self.cur_pl = "Моя музыка"
         self.queue, self.qi, self.queue_pl = [], -1, None
         self.loop_mode, self.speed_i = 0, SPEEDS.index(1.0)
@@ -1593,6 +2155,10 @@ class PlayerApp(App):
         Animation(opacity=1, d=0.6, t="out_cubic").start(sm)
         Clock.schedule_interval(self.tick, 0.25)
         Clock.schedule_interval(self.tick_ind, 0.26)
+        self.setup_settings_ui()
+        self.setup_sources_ui()
+        self.apply_bg()
+        self._bg_loading = False
 
     def on_pause(self):
         return True            # музыка продолжает играть в фоне
@@ -1610,6 +2176,14 @@ class PlayerApp(App):
                 self.tick(0)
         except Exception:
             pass
+        if self._rick_resume:                # вернулись из браузера — продолжаем музыку
+            self._rick_resume = False
+            try:
+                if self.engine.loaded and not self.playing:
+                    self.engine.start()
+                    self.set_playing(True)
+            except Exception:
+                pass
 
     # ---------- аудиофокус (Телеграм, звонки, другие плееры) ----------
     def on_focus_change(self, change):
@@ -1672,10 +2246,13 @@ class PlayerApp(App):
                 self.data["titles"] = d.get("titles", {})
                 self.data["covers"] = d.get("covers", {})
                 self.data["track_covers"] = d.get("track_covers", {})
+                self.data["bg"] = {**BG_DEFAULT, **d.get("bg", {})}
+                self.data["jamendo_id"] = str(d.get("jamendo_id", ""))
                 if d.get("current") in self.data["playlists"]:
                     self.cur_pl = d["current"]
         except Exception:
             pass
+        JAMENDO["id"] = self.data.get("jamendo_id", "")
         if self.cur_pl not in self.data["playlists"]:
             self.cur_pl = next(iter(self.data["playlists"]))
 
@@ -1684,6 +2261,7 @@ class PlayerApp(App):
             Path(self.user_data_dir).mkdir(parents=True, exist_ok=True)
             out = {"playlists": self.data["playlists"], "titles": self.data["titles"],
                    "covers": self.data["covers"], "track_covers": self.data["track_covers"],
+                   "bg": self.data["bg"], "jamendo_id": self.data.get("jamendo_id", ""),
                    "current": self.cur_pl}
             (Path(self.user_data_dir) / "player.json").write_text(
                 json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1719,6 +2297,8 @@ class PlayerApp(App):
         if screen.name not in ("player", "settings"):
             return
         box = screen.children[0] if screen.children else None
+        if isinstance(box, ScrollView) and box.children:
+            box = box.children[0]
         if box is None:
             return
         for i, w in enumerate(reversed(box.children)):
@@ -1736,9 +2316,15 @@ class PlayerApp(App):
         (Animation(opacity=1, y=dp(150), d=0.35, t="out_back") + Animation(d=2.0) +
          Animation(opacity=0, d=0.4)).start(t)
 
-    def ask_text(self, title, initial, cb):
+    def ask_text(self, title, initial, cb, hint=""):
         ti = Input(text=initial)
         box = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(12))
+        if hint:
+            lbl = Label(text=hint, size_hint_y=None, font_size=sp(13), halign="left",
+                        valign="top", color=DIM)
+            lbl.bind(width=lambda w, v: setattr(w, "text_size", (v, None)),
+                     texture_size=lambda w, s: setattr(w, "height", s[1]))
+            box.add_widget(lbl)
         box.add_widget(ti)
         row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
         cancel = RoundButton(text="Отмена")
@@ -1746,8 +2332,8 @@ class PlayerApp(App):
         row.add_widget(cancel)
         row.add_widget(ok)
         box.add_widget(row)
-        pop = Popup(title=title, content=box, size_hint=(0.9, None), height=dp(200),
-                    separator_color=GREEN)
+        pop = Popup(title=title, content=box, size_hint=(0.9, None),
+                    height=dp(200) + (dp(110) if hint else 0), separator_color=GREEN)
 
         def done(*a):
             v = ti.text.strip()
@@ -1994,7 +2580,7 @@ class PlayerApp(App):
         except Exception:
             pass
 
-    def pick_image(self, callback):
+    def pick_image(self, callback, max_side=1400):
         """Открывает выбор фото. callback(путь_к_копии) вызывается в основном потоке."""
         if not ON_ANDROID:
             path = None
@@ -2019,6 +2605,7 @@ class PlayerApp(App):
         from android import activity
         from jnius import autoclass
         self._img_cb = callback
+        self._img_max = max_side
         Intent = autoclass("android.content.Intent")
         intent = Intent(Intent.ACTION_GET_CONTENT)
         intent.setType("image/*")
@@ -2041,7 +2628,7 @@ class PlayerApp(App):
 
         def work():
             try:
-                import_android_image(uri, dest)
+                import_android_image(uri, dest, getattr(self, "_img_max", 1400))
             except Exception as e:
                 self._image_done(None, cb, str(e))
                 return
@@ -2333,27 +2920,37 @@ class PlayerApp(App):
             self.online_status = "Сначала введи, что искать."
             shake(self.onl.ids.q)
             return
-        self.online_status = "Ищу…"
+        src = SOURCES[self.cur_src]
+        if src[0] == "Jamendo" and not JAMENDO["id"]:
+            self.ask_jamendo_key(lambda: self.online_search(text))
+            return
+        self.start_dots("Ищу")
 
         def work():
             try:
-                items = ia_search(text)
+                items = src[1](text)
             except Exception as e:
-                self._online_error(str(e))
+                Logger.exception("Player: ошибка поиска")
+                self._online_error(str(e) or repr(e))
                 return
             self._search_done(items)
         threading.Thread(target=work, daemon=True).start()
 
     @mainthread
     def _online_error(self, msg):
+        self.stop_dots()
+        if SOURCES[self.cur_src][0] == "Jamendo" and "client" in msg.lower():
+            self.set_jamendo_key("")          # ключ не подошёл — спросим заново
         self.online_status = f"Не получилось (нет интернета или сайт не отвечает): {msg}"
 
     @mainthread
     def _search_done(self, items):
+        self.stop_dots()
         self.res_items = items
         self.show_results()
 
     def show_results(self):
+        self.stop_dots()
         self.online_stage = "results"
         self._set_rows(self.onl.ids.rv, [
             {"title": t, "subtitle": "", "idx": i, "selected": False,
@@ -2369,13 +2966,15 @@ class PlayerApp(App):
             return
         ident = self.res_items[idx][1]
         self.cur_ident = ident
-        self.online_status = "Загружаю список треков…"
+        get_tracks = SOURCES[self.cur_src][2]
+        self.start_dots("Загружаю список треков")
 
         def work():
             try:
-                tracks = ia_tracks(ident)
+                tracks = get_tracks(ident)
             except Exception as e:
-                self._online_error(str(e))
+                Logger.exception("Player: ошибка списка треков")
+                self._online_error(str(e) or repr(e))
                 return
             self._tracks_done(ident, tracks)
         threading.Thread(target=work, daemon=True).start()
@@ -2384,6 +2983,7 @@ class PlayerApp(App):
     def _tracks_done(self, ident, tracks):
         if ident != self.cur_ident:
             return
+        self.stop_dots()
         if not tracks:
             self.online_status = "В этой записи нет mp3/ogg — выбери другую."
             return
@@ -2432,7 +3032,11 @@ class PlayerApp(App):
         bar = self.onl.ids.bar
         Animation.cancel_all(bar)
         bar.value = 0
-        dest = self.dl_dir()
+        try:
+            dest = self.dl_dir()
+        except Exception:
+            Logger.exception("Player: нет внешней папки, пишем во внутреннюю")
+            dest = Path(self.user_data_dir) / "music"
         threading.Thread(target=self._dl_work, args=(jobs, dest), daemon=True).start()
 
     def _dl_work(self, jobs, dest):
@@ -2473,8 +3077,9 @@ class PlayerApp(App):
                 part.replace(path)
                 self._dl_got(str(path))
             self._dl_done()
-        except Exception as e:
-            self._dl_failed(str(e))
+        except BaseException as e:
+            Logger.exception("Player: ошибка скачивания")
+            self._dl_failed(str(e) or repr(e))
 
     @mainthread
     def _dl_progress(self, pct, name):
@@ -2493,11 +3098,210 @@ class PlayerApp(App):
         self.dl_busy = False
         Animation(value=100, d=0.25).start(self.onl.ids.bar)
         self.online_status = "Готово! Треки добавлены в текущий плейлист."
+        try:
+            self.root.ids.confetti.burst()          # салют
+        except Exception:
+            Logger.exception("Player: конфетти")
 
     @mainthread
     def _dl_failed(self, msg):
         self.dl_busy = False
         self.online_status = f"Ошибка скачивания: {msg}"
+
+    # ---------- фон (настройки) ----------
+    def setup_settings_ui(self):
+        st = self.root.ids.sett
+        cfg = self.data["bg"]
+        grid = st.ids.modes
+        grid.clear_widgets()
+        self._mode_chips = {}
+        for key, title in BG_MODES:
+            c = ModeChip(text=title, active=(cfg["mode"] == key), size_hint_y=None, height=dp(44))
+            c.bind(on_release=lambda w, k=key: self.set_bg_mode(k))
+            grid.add_widget(c)
+            self._mode_chips[key] = c
+        st.ids.dim_sl.value = cfg["dim"]
+        st.ids.speed_sl.value = cfg["speed"]
+        self.update_bg_texts()
+
+    def update_bg_texts(self):
+        cfg = self.data["bg"]
+        self.bg_dim_text = f"{cfg['dim']}%"
+        self.bg_speed_text = f"{cfg['speed']}%"
+        if cfg["mode"] == "image":
+            self.bg_file_text = ("Обои выбраны." if cfg.get("image")
+                                 else "Картинка не выбрана — нажми кнопку ниже.")
+        else:
+            self.bg_file_text = ""
+        self.jamendo_text = "Ключ Jamendo задан." if JAMENDO["id"] else "Ключ Jamendo не задан."
+
+    def apply_bg(self):
+        self.root.ids.bg.apply(self.data["bg"])
+
+    def set_bg_mode(self, key):
+        cfg = self.data["bg"]
+        cfg["mode"] = key
+        for k, c in self._mode_chips.items():
+            c.active = (k == key)
+        self.update_bg_texts()
+        self.apply_bg()
+        self.save()
+        if key == "image" and not cfg.get("image"):
+            self.toast("Выбери картинку для фона")
+
+    def on_bg_slider(self, key, val):
+        if self._bg_loading:
+            return
+        self.data["bg"][key] = int(val)
+        self.update_bg_texts()
+        self.apply_bg()
+        if self._save_ev is not None:
+            self._save_ev.cancel()
+        self._save_ev = Clock.schedule_once(lambda dt: self.save(), 0.6)
+
+    def pick_bg_image(self):
+        self.pick_image(self._bg_image_chosen, max_side=2600)
+
+    def _bg_image_chosen(self, path):
+        cfg = self.data["bg"]
+        self.remove_cover_file(cfg.get("image"))
+        cfg["image"], cfg["mode"] = path, "image"
+        for k, c in self._mode_chips.items():
+            c.active = (k == "image")
+        self.update_bg_texts()
+        self.apply_bg()
+        self.save()
+        self.toast("Обои установлены")
+
+    def reset_bg(self):
+        cfg = self.data["bg"]
+        self.remove_cover_file(cfg.get("image"))
+        cfg.clear()
+        cfg.update(BG_DEFAULT)
+        self._bg_loading = True
+        self.setup_settings_ui()
+        self._bg_loading = False
+        self.apply_bg()
+        self.save()
+        self.toast("Фон сброшен")
+
+    # ---------- источники музыки ----------
+    def setup_sources_ui(self):
+        box = self.onl.ids.srcs
+        box.clear_widgets()
+        self._src_chips = []
+        for i, src in enumerate(SOURCES):
+            c = Chip(text=src[0], active=(i == self.cur_src))
+            c.bind(on_release=lambda w, i=i: self.set_source(i))
+            box.add_widget(c)
+            self._src_chips.append(c)
+        self.src_hint = SOURCES[self.cur_src][3]
+
+    def set_source(self, i):
+        if i == self.cur_src:
+            return
+        self.cur_src, self.cur_ident = i, None
+        for k, c in enumerate(self._src_chips):
+            c.active = (k == i)
+        self.stop_dots()
+        self.res_items, self.trk_items, self.trk_sel = [], [], set()
+        self.online_stage = "results"
+        self.onl.ids.rv.data = []
+        self.src_hint = SOURCES[i][3]
+        hint = self.onl.ids.hint                    # подсказка плавно проявляется
+        Animation.cancel_all(hint, "opacity")
+        hint.opacity = 0
+        Animation(opacity=1, d=0.5).start(hint)
+        self.online_status = f"Источник: {SOURCES[i][0]}. Введи запрос и нажми поиск."
+
+    def start_dots(self, base):
+        """Бегущие точки: «Ищу», «Ищу.», «Ищу..»…"""
+        self._dots_base, self._dots_i = base, 0
+        self.online_status = base
+        if self._dots_ev is None:
+            self._dots_ev = Clock.schedule_interval(self._dots_tick, 0.35)
+
+    def stop_dots(self):
+        if self._dots_ev is not None:
+            self._dots_ev.cancel()
+            self._dots_ev = None
+
+    def _dots_tick(self, dt):
+        self._dots_i += 1
+        self.online_status = self._dots_base + "." * (self._dots_i % 4)
+
+    def ask_jamendo_key(self, then=None):
+        def cb(key):
+            self.set_jamendo_key(key)
+            if then:
+                then()
+        self.ask_text("Ключ Jamendo", JAMENDO["id"], cb,
+                      hint="Нужен бесплатный ключ (client_id): зарегистрируйся на "
+                           "devportal.jamendo.com, создай приложение и вставь сюда его client_id.")
+
+    def set_jamendo_key(self, key):
+        JAMENDO["id"] = key
+        self.data["jamendo_id"] = key
+        self.save()
+        self.update_bg_texts()
+
+    def sites_menu(self):
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        pop = Popup(title="Открыть сайт в браузере", content=box, size_hint=(0.92, None),
+                    height=dp(90) + dp(58) * len(SITES), separator_color=GREEN)
+        for title, link in SITES:
+            b = RoundButton(text=title, icon="globe", size_hint_y=None, height=dp(48),
+                            font_size=sp(13))
+            b.bind(on_release=lambda w, u=link: (pop.dismiss(), open_url(u)))
+            box.add_widget(b)
+        self._popup = pop
+        pop.open()
+
+    # ---------- тап по обложке и пасхалка ----------
+    def cover_tapped(self):
+        """Обложка подпрыгивает (это делает сама). Семь быстрых тапов — сюрприз."""
+        now = time.monotonic()
+        self._cover_taps = [t for t in self._cover_taps if now - t < 3.0] + [now]
+        if len(self._cover_taps) >= 7:
+            self._cover_taps = []
+            self.rickroll()
+
+    def rickroll(self):
+        self._rick_resume = self.playing
+        if self.playing:
+            self.engine.pause()
+            self.set_playing(False)
+        open_url(RICK_URL)
+
+    # ---------- ошибки ----------
+    def report_error(self, tb):
+        self.last_error = tb
+        try:
+            (Path(self.user_data_dir) / "last_error.txt").write_text(tb, encoding="utf-8")
+        except Exception:
+            pass
+        last = tb.strip().splitlines()[-1] if tb.strip() else "ошибка"
+        try:
+            self.toast("Ошибка: " + last[:70])
+        except Exception:
+            pass
+
+    def show_error_log(self):
+        text = self.last_error or "Ошибок пока не было."
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+        sv = ScrollView()
+        lbl = Label(text=text, size_hint_y=None, font_size=sp(11), halign="left", valign="top",
+                    color=LIGHT)
+        lbl.bind(width=lambda w, v: setattr(w, "text_size", (v, None)),
+                 texture_size=lambda w, s: setattr(w, "height", s[1]))
+        sv.add_widget(lbl)
+        box.add_widget(sv)
+        close = RoundButton(text="Закрыть", size_hint_y=None, height=dp(46))
+        box.add_widget(close)
+        pop = Popup(title="Журнал ошибок", content=box, size_hint=(0.94, 0.8), separator_color=GREEN)
+        close.bind(on_release=lambda *a: pop.dismiss())
+        self._popup = pop
+        pop.open()
 
 
 if __name__ == "__main__":
