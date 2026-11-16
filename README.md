@@ -1,4 +1,5 @@
 # Мой плеер — Android (Kivy)
+Artifact download URL: https://github.com/m00ncatr/Moon_Player/actions/runs/43938628685/artifacts/14261609260
 
 ## Проверка на компьютере
     pip install "kivy[base]" mutagen certifi
